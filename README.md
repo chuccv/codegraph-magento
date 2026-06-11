@@ -35,6 +35,8 @@
 
 </div>
 
+> **Fork notice** — This is a community fork of [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) (MIT) that adds **Magento 2 XML-wiring resolution** on top of upstream. Everything upstream does still works unchanged; the only addition is described in [Magento 2 wiring](#magento-2-wiring-this-fork). Full credit for CodeGraph itself goes to the original author — the `LICENSE` and its copyright notice are kept intact.
+
 ## Get Started
 
 ### 1. Install the CLI
@@ -308,6 +310,28 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
 Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+
+---
+
+## Magento 2 wiring (this fork)
+
+Magento is wired in **XML, not PHP** — the part that actually connects classes lives in `di.xml`, `events.xml`, `webapi.xml`, `routes.xml`, and view-layout XML. Stock CodeGraph parses only PHP, so those connections were invisible and flow questions dead-ended at every wiring boundary ("which concrete class runs for this interface?", "what plugins intercept this method?", "which observer handles this event?"). This fork resolves them into the graph:
+
+| Magento mechanism | Declared in | Resolved into the graph |
+|---|---|---|
+| `<preference for type>` | di.xml | interface → concrete class (`overrides`) |
+| `<plugin>` before/after/around | di.xml | target method → interceptor method |
+| `<virtualType>` | di.xml | virtual-type class node → base type |
+| `<observer>` | events.xml | event → the observer's `execute()` |
+| `<service>` | webapi.xml | REST/SOAP route node → service `Class::method` |
+| `<route>` | routes.xml | frontName route node |
+| `<block class>` | layout XML | layout → block class |
+
+Every synthesized edge is tagged `provenance:'heuristic'` with `metadata.synthesizedBy: 'magento-*'` and the `area` (`global` / `frontend` / `adminhtml`), so an agent can see exactly how a hop entered the graph.
+
+Resolution is **namespace-aware**: it understands Magento's PSR-4 `Vendor\Module → vendor/<vendor>/module-<name>/` directory convention, so a custom module's `<preference>` / `<plugin>` over a **core** interface resolves to the real `vendor/magento` class rather than a same-named custom one. Index `vendor/magento` to connect custom → core; coverage degrades gracefully (no edge, never a wrong one) when core isn't indexed.
+
+> Detection is automatic — a project is treated as Magento when it has `app/etc/di.xml`, a `bin/magento` binary, or a `magento/*` Composer dependency.
 
 ---
 
