@@ -21,11 +21,17 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node, NodeKind } from '../types';
+import type { Edge, EdgeKind, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
+import {
+  fqcnSimpleName,
+  isLayoutXml,
+  matchPhpNodeForFqcn,
+  xmlFileNodeId,
+} from './frameworks/magento';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -1646,10 +1652,209 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
   return edges;
 }
 
+// ---------------------------------------------------------------------------
+// Magento 2 XML wiring — direct PHP↔PHP edges.
+//
+// New-symbol nodes (virtualType, webapi/routes routes) are created by the
+// magento framework resolver's extract(); THIS pass adds the wiring edges that
+// don't introduce a new symbol, by re-reading the XML and looking PHP types up
+// by name. All edges are `provenance:'heuristic'`. Endpoints in an unindexed
+// `vendor/` simply yield no edge (graceful). See frameworks/magento.ts.
+//
+//  - preference → interface `overrides` concrete class
+//  - plugin     → target method `references` before/after/around method
+//  - observer   → events.xml file `references` observer execute()
+//  - layout     → layout xml file `references` block class
+// ---------------------------------------------------------------------------
+
+/** Magento area (frontend/adminhtml/webapi_rest/…) from an XML file path. */
+function magentoAreaOf(filePath: string): string {
+  const etc = /\/etc\/([^/]+)\/[^/]+\.xml$/.exec(filePath);
+  if (etc) return etc[1]!;
+  const view = /\/view\/([^/]+)\//.exec(filePath);
+  if (view) return view[1]!;
+  return 'global';
+}
+
+function magentoXmlEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  // Cheap pre-filter: only proceed if the project actually has Magento wiring XML.
+  const wiringFiles: string[] = [];
+  for (const f of ctx.getAllFiles()) {
+    const base = f.split('/').pop() ?? f;
+    if (base === 'di.xml' || base === 'events.xml' || isLayoutXml(f)) wiringFiles.push(f);
+  }
+  if (wiringFiles.length === 0) return [];
+
+  // Index PHP type nodes by simple name for FQCN matching (qualified_name has
+  // no namespace, so we match on the last segment + path-suffix disambiguation).
+  const phpTypesByName = new Map<string, Node[]>();
+  for (const kind of ['class', 'interface', 'trait'] as NodeKind[]) {
+    for (const n of queries.iterateNodesByKind(kind)) {
+      if (n.language !== 'php') continue;
+      const arr = phpTypesByName.get(n.name);
+      if (arr) arr.push(n);
+      else phpTypesByName.set(n.name, [n]);
+    }
+  }
+  if (phpTypesByName.size === 0) return [];
+
+  const findType = (fqcn: string): Node | null => {
+    const cands = phpTypesByName.get(fqcnSimpleName(fqcn));
+    if (!cands || cands.length === 0) return null;
+    return matchPhpNodeForFqcn(cands, fqcn);
+  };
+
+  // Lazy class-id → method nodes.
+  const methodCache = new Map<string, Node[]>();
+  const methodsOf = (classId: string): Node[] => {
+    const cached = methodCache.get(classId);
+    if (cached) return cached;
+    const out: Node[] = [];
+    for (const e of queries.getOutgoingEdges(classId, ['contains'])) {
+      const n = queries.getNodeById(e.target);
+      if (n && n.kind === 'method') out.push(n);
+    }
+    methodCache.set(classId, out);
+    return out;
+  };
+
+  const edges: Edge[] = [];
+  const push = (
+    source: string,
+    target: string,
+    kind: EdgeKind,
+    meta: Record<string, unknown>,
+    line?: number
+  ): void => {
+    edges.push({ source, target, kind, line, provenance: 'heuristic', metadata: meta });
+  };
+
+  for (const file of wiringFiles) {
+    const base = file.split('/').pop() ?? file;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+    const area = magentoAreaOf(file);
+
+    if (base === 'di.xml') {
+      // <preference for="A" type="B"/>
+      const prefRe = /<preference\b([^>]*?)\/?>/g;
+      let m: RegExpExecArray | null;
+      while ((m = prefRe.exec(content)) !== null) {
+        const a = m[1] ?? '';
+        const forC = /\bfor\s*=\s*"([^"]+)"/.exec(a)?.[1];
+        const typeC = /\btype\s*=\s*"([^"]+)"/.exec(a)?.[1];
+        if (!forC || !typeC) continue;
+        const iface = findType(forC);
+        const impl = findType(typeC);
+        if (iface && impl && iface.id !== impl.id) {
+          push(iface.id, impl.id, 'overrides', {
+            synthesizedBy: 'magento-preference',
+            area,
+            for: forC,
+            type: typeC,
+            registeredAt: file,
+          });
+        }
+      }
+
+      // <type name="T"> … <plugin type="P" disabled? sortOrder?/> … </type>
+      const typeRe = /<type\b([^>]*)>([\s\S]*?)<\/type>/g;
+      let tm: RegExpExecArray | null;
+      while ((tm = typeRe.exec(content)) !== null) {
+        const targetFqcn = /\bname\s*=\s*"([^"]+)"/.exec(tm[1] ?? '')?.[1];
+        if (!targetFqcn) continue;
+        const targetCls = findType(targetFqcn);
+        if (!targetCls) continue;
+        const targetMethods = methodsOf(targetCls.id);
+        const pluginRe = /<plugin\b([^>]*?)\/?>/g;
+        let pm: RegExpExecArray | null;
+        while ((pm = pluginRe.exec(tm[2] ?? '')) !== null) {
+          const pa = pm[1] ?? '';
+          if (/\bdisabled\s*=\s*"true"/.test(pa)) continue;
+          const pType = /\btype\s*=\s*"([^"]+)"/.exec(pa)?.[1];
+          if (!pType) continue;
+          const pluginCls = findType(pType);
+          if (!pluginCls) continue;
+          const sortOrder = /\bsortOrder\s*=\s*"([^"]+)"/.exec(pa)?.[1];
+          for (const pmeth of methodsOf(pluginCls.id)) {
+            const mm = /^(before|after|around)([A-Z]\w*)$/.exec(pmeth.name);
+            if (!mm) continue;
+            const targetName = mm[2]![0]!.toLowerCase() + mm[2]!.slice(1);
+            const tgt = targetMethods.find((x) => x.name === targetName);
+            if (!tgt) continue;
+            push(
+              tgt.id,
+              pmeth.id,
+              'references',
+              {
+                synthesizedBy: 'magento-plugin',
+                pluginType: mm[1],
+                area,
+                plugin: pType,
+                sortOrder,
+                registeredAt: file,
+              },
+              tgt.startLine
+            );
+          }
+        }
+      }
+    } else if (base === 'events.xml') {
+      // <event name="E"> <observer instance="O" method="m"/> </event>
+      const fileId = xmlFileNodeId(file);
+      const evRe = /<event\b([^>]*)>([\s\S]*?)<\/event>/g;
+      let em: RegExpExecArray | null;
+      while ((em = evRe.exec(content)) !== null) {
+        const eventName = /\bname\s*=\s*"([^"]+)"/.exec(em[1] ?? '')?.[1] ?? '?';
+        const obsRe = /<observer\b([^>]*?)\/?>/g;
+        let om: RegExpExecArray | null;
+        while ((om = obsRe.exec(em[2] ?? '')) !== null) {
+          const oa = om[1] ?? '';
+          if (/\bdisabled\s*=\s*"true"/.test(oa)) continue;
+          const inst = /\binstance\s*=\s*"([^"]+)"/.exec(oa)?.[1];
+          if (!inst) continue;
+          const obs = findType(inst);
+          if (!obs) continue;
+          const exec = methodsOf(obs.id).find((x) => x.name === 'execute');
+          push((fileId), (exec ?? obs).id, 'references', {
+            synthesizedBy: 'magento-observer',
+            event: eventName,
+            area,
+            observer: inst,
+            registeredAt: file,
+          });
+        }
+      }
+    } else {
+      // Layout XML: <block class="C">, <referenceBlock>…<block class="C">
+      const fileId = xmlFileNodeId(file);
+      const blkRe = /<block\b([^>]*?)\bclass\s*=\s*"([^"]+)"/g;
+      const seenLayout = new Set<string>();
+      let bm: RegExpExecArray | null;
+      while ((bm = blkRe.exec(content)) !== null) {
+        const cls = bm[2]!;
+        if (seenLayout.has(cls)) continue;
+        seenLayout.add(cls);
+        const node = findType(cls);
+        if (!node) continue;
+        push(fileId, node.id, 'references', {
+          synthesizedBy: 'magento-layout-block',
+          area,
+          block: cls,
+          registeredAt: file,
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
 /**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
  * React re-render + JSX children + Vue templates + SvelteKit load + RN event
- * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain).
+ * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain +
+ * Magento DI/event/layout wiring).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
@@ -1687,6 +1892,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const magentoEdges = magentoXmlEdges(queries, ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1710,6 +1916,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...magentoEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
